@@ -1,0 +1,310 @@
+/* PROJECT: Smart Helmet System - Helmet Unit (Transmitter)
+   AUTHOR: Shivam Markanday
+   HARDWARE: ESP32, Accelerometer, MQ-3, Vibration Sensor, GPS, Reed Switch
+   
+   DESCRIPTION:
+   - This unit is worn on the helmet. It reads sensor data to determine safety.
+   - Logic: 
+     1. Checks if Helmet is worn (Reed Switch).
+     2. Checks for Alcohol (MQ-3) or Crash (Vibration + Accelerometer).
+     3. Sends ON/OFF command to the Bike Unit via ESP-NOW.
+   - Connectivity:
+     1. ESP-NOW: For low-latency control of the bike ignition.
+     2. WiFi/Blynk: For cloud logging and "Crash Alert" notifications with GPS location.
+*/
+
+// ==========================================
+// BLYNK CONFIGURATION
+// ==========================================
+#define BLYNK_PRINT Serial
+#define BLYNK_TEMPLATE_ID   "YOUR_TEMPLATE_ID"   // <--- ENTER BLYNK TEMPLATE ID
+#define BLYNK_TEMPLATE_NAME "YOUR_TEMPLATE_NAME" // <--- ENTER BLYNK TEMPLATE NAME
+#define BLYNK_AUTH_TOKEN    "YOUR_BLYNK_TOKEN"   // <--- ENTER BLYNK TOKEN
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Arduino.h>
+#include <math.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include <esp_now.h>
+
+// ==========================================
+// WIFI CREDENTIALS
+// ==========================================
+char ssid[] = "YOUR_WIFI_SSID";     // <--- ENTER WIFI NAME
+char pass[] = "YOUR_WIFI_PASSWORD"; // <--- ENTER WIFI PASS
+
+// ==========================================
+// ESP-NOW CONFIGURATION
+// ==========================================
+// MAC Address of the Base Receiver (The Bike Unit)
+// REPLACE THIS with the MAC address printed by your Receiver code
+uint8_t BASE_MAC_ADDR[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; 
+
+// Packet structure (Must match Base Unit)
+typedef struct struct_message {
+    uint8_t cmd;    // 0x01 = ON, 0x00 = OFF
+    uint32_t seq;   // Sequence number
+} struct_message;
+
+struct_message outboundPacket;
+esp_now_peer_info_t peerInfo;
+uint32_t sequenceNumber = 0;
+
+// ==========================================
+// HARDWARE PINS
+// ==========================================
+const int PIN_REED = 21;        // Reed switch DO (Helmet Worn Check)
+const int PIN_VIB = 23;         // Vibration sensor DO
+const int PIN_MQ3 = 33;         // Analog MQ-3 (Alcohol)
+const int PIN_AX = 34;          // Accel X
+const int PIN_AY = 35;          // Accel Y
+const int PIN_AZ = 32;          // Accel Z
+const int PIN_BUZZER = 19;      // Buzzer
+
+// ==========================================
+// GPS CONFIGURATION
+// ==========================================
+#define RXD2 16                 // GPS TX -> ESP32 RX2
+#define TXD2 17                 // GPS RX -> ESP32 TX2
+#define GPS_BAUD 9600           
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);    // Use UART2
+
+// ==========================================
+// SENSOR THRESHOLDS & SETTINGS
+// ==========================================
+const int VIBRATION_TRIGGER_STATE = LOW; 
+const int REED_WORN_STATE = LOW; // Magnet Near usually = LOW
+int MQ3_THRESHOLD = 3000; 
+
+// Accel Calibration Data
+const float VCC = 3.3f;
+const int ADC_MAX = 4095;       
+const float ACC_SENSITIVITY = 0.300f; 
+const int CAL_SAMPLES = 200;
+
+// Accident Detection Thresholds
+float ACCIDENT_G_THRESHOLD = 2.0f;    
+float DELTA_G_THRESHOLD    = 1.2f;    
+
+// Timing & Debounce
+unsigned long lastAccidentTime = 0;
+const unsigned long ACCIDENT_LOCK_MS = 5000; 
+
+// Internal State
+float offsetX=0, offsetY=0, offsetZ=0;
+float lastMagnitude = 1.0f; 
+
+// ==========================================
+// HELPER FUNCTIONS
+// ==========================================
+
+// Transmit command to Bike Unit via ESP-NOW
+void sendRelayCommand(bool on) {
+  outboundPacket.cmd = on ? 0x01 : 0x00; // Fixed Logic: 1=ON, 0=OFF to match receiver
+  outboundPacket.seq = sequenceNumber++;
+
+  esp_err_t result = esp_now_send(BASE_MAC_ADDR, (uint8_t *)&outboundPacket, sizeof(outboundPacket));
+  
+  if (result != ESP_OK) {
+    // Fail silently to avoid serial spam
+  }
+}
+
+// Callback: Check if data delivery was successful
+void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  // Optional: Add debug print here if needed
+}
+
+// Buzzer: Play a tone for a specific duration
+void triggerBuzzer(int duration) {
+  tone(PIN_BUZZER, 2000); 
+  delay(duration);
+  noTone(PIN_BUZZER);     
+}
+
+// Calibrate Accelerometer (Call while helmet is stationary)
+void accelCalibration() {
+  long sumX=0,sumY=0,sumZ=0;
+  for (int i=0;i<CAL_SAMPLES;i++){
+    sumX += analogRead(PIN_AX);
+    sumY += analogRead(PIN_AY);
+    sumZ += analogRead(PIN_AZ);
+    delay(5);
+  }
+  offsetX = (sumX / (float)CAL_SAMPLES) * (VCC / ADC_MAX);
+  offsetY = (sumY / (float)CAL_SAMPLES) * (VCC / ADC_MAX);
+  offsetZ = (sumZ / (float)CAL_SAMPLES) * (VCC / ADC_MAX);
+}
+
+// ==========================================
+// MAIN SETUP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // 1. Init Pins
+  pinMode(PIN_REED, INPUT);      
+  pinMode(PIN_VIB, INPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  noTone(PIN_BUZZER); 
+
+  // 2. Init GPS
+  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, RXD2, TXD2);
+  Serial.println(F("GPS Serial Started..."));
+
+  // 3. Connect to Blynk (WiFi)
+  Serial.println("Connecting to Blynk...");
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  // 4. Init ESP-NOW (Must come AFTER WiFi initialization)
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+  esp_now_register_send_cb(onDataSent);
+
+  // Register Peer (The Bike Unit)
+  memcpy(peerInfo.peer_addr, BASE_MAC_ADDR, 6);
+  peerInfo.channel = WiFi.channel(); // Sync channel with WiFi router
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Failed to add peer");
+    return;
+  }
+
+  // 5. Calibration
+  Serial.println(F("\n--- Smart Safety Helmet - Transmitter ---"));
+  Serial.println(F("Calibrating accelerometer..."));
+  accelCalibration();
+
+  Serial.printf("Calibration done. Offsets: %.2f %.2f %.2f\n", offsetX, offsetY, offsetZ);
+  
+  // Startup Beep
+  triggerBuzzer(100); 
+  Serial.println("System Ready.");
+  
+  // Ensure OFF at start
+  sendRelayCommand(false);
+}
+
+// ==========================================
+// MAIN LOOP
+// ==========================================
+void loop() {
+  Blynk.run();
+  unsigned long now = millis();
+
+  // 1. GPS: Parse incoming NMEA data
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+
+  // 2. Read Sensors
+  bool helmetWorn = (digitalRead(PIN_REED) == REED_WORN_STATE);
+  int vibState = digitalRead(PIN_VIB);
+  bool vibTriggered = (vibState == VIBRATION_TRIGGER_STATE);
+  
+  // Accel Calculations
+  int rawX = analogRead(PIN_AX);
+  int rawY = analogRead(PIN_AY);
+  int rawZ = analogRead(PIN_AZ);
+  float vX = rawX * (VCC / ADC_MAX);
+  float vY = rawY * (VCC / ADC_MAX);
+  float vZ = rawZ * (VCC / ADC_MAX);
+  float gX = (vX - offsetX) / ACC_SENSITIVITY;
+  float gY = (vY - offsetY) / ACC_SENSITIVITY;
+  float gZ = (vZ - offsetZ) / ACC_SENSITIVITY;
+  float mag = sqrt(gX*gX + gY*gY + gZ*gZ);
+  float delta = fabs(mag - lastMagnitude);
+  lastMagnitude = mag;
+
+  // MQ-3 Alcohol Check
+  int mq3_raw = analogRead(PIN_MQ3); 
+  bool alcoholDetected = (mq3_raw >= MQ3_THRESHOLD);
+
+  // Accident Logic (High G-Force OR High Delta + Vibration)
+  bool accelAccident = (mag >= ACCIDENT_G_THRESHOLD) || (delta >= DELTA_G_THRESHOLD);
+  bool accident = accelAccident && vibTriggered; 
+
+  // 3. Motor/Relay Decision Logic
+  bool motorAllowed = true; 
+
+  // Condition A: Helmet Check
+  if (!helmetWorn) {
+    motorAllowed = false;
+  }
+
+  // Condition B: Alcohol Check
+  if (alcoholDetected) {
+    motorAllowed = false;
+    lastAccidentTime = now; 
+    Serial.println("[ALERT] Alcohol detected -> Motor Stopped!");
+    triggerBuzzer(200); // Short beep
+  }
+
+  // Condition C: Accident Check
+  if (accident) {
+    motorAllowed = false;
+    lastAccidentTime = now; 
+    Serial.println("[ALERT] Accident detected -> Motor Stopped!");
+    triggerBuzzer(1000); // Long beep
+    
+    // Generate Google Maps Link (REVERTED TO ORIGINAL)
+    String mapLink = "https://www.google.com/maps?q=";
+    if (gps.location.isValid()) {
+      mapLink += String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
+      Serial.printf("CRASH LOC: %f, %f\n", gps.location.lat(), gps.location.lng());
+    } else {
+      mapLink += "0.0,0.0";
+      Serial.println("CRASH LOC: No GPS Fix");
+    }
+
+    // Send Notification to Blynk App
+    Blynk.logEvent("crash_alert", String("CRASH! Loc: ") + mapLink);
+    Blynk.virtualWrite(V6, 1); // Turn on Virtual LED for Crash
+  } else {
+    Blynk.virtualWrite(V6, 0); // Turn off Virtual LED
+  }
+
+  // Condition D: Lockout Timer (Prevent restart immediately after accident)
+  if ((now - lastAccidentTime) < ACCIDENT_LOCK_MS) {
+    motorAllowed = false;
+  }
+
+  // 4. Transmit Command to Bike
+  sendRelayCommand(motorAllowed);
+
+  // 5. Format GPS for display
+  String gpsLoc = "No Fix";
+  if (gps.location.isValid()) {
+    gpsLoc = String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
+  }
+
+  // 6. Serial Debug Output
+  Serial.printf("VIB=%d | MQ3=%d | H=%s | g=%.2f | LOC=%s | CMD=%s\n",
+                vibState, 
+                mq3_raw, 
+                helmetWorn ? "WORN" : "OFF", 
+                mag, 
+                gpsLoc.c_str(), 
+                motorAllowed ? "ON" : "OFF");
+
+  // 7. Update Blynk Dashboard (Limit to every 1 sec to save bandwidth)
+  static unsigned long lastPush = 0;
+  if (now - lastPush > 1000) {
+    Blynk.virtualWrite(V0, motorAllowed);
+    Blynk.virtualWrite(V1, mq3_raw);
+    Blynk.virtualWrite(V2, helmetWorn);
+    Blynk.virtualWrite(V3, mag);
+    Blynk.virtualWrite(V4, gpsLoc); // Location Text
+    Blynk.virtualWrite(V5, gps.satellites.value());
+    lastPush = now;
+  }
+
+  delay(150); 
+}
