@@ -1,0 +1,129 @@
+
+/*
+ * PROJECT: Smart Helmet - Base Receiver (Bike Unit)
+ * DESCRIPTION: 
+ * - Acts as the receiver on the motorcycle.
+ * - Listens for ESP-NOW heartbeat packets from the Smart Helmet.
+ * - Controls the ignition relay based on helmet status.
+ * - SAFETY FEATURE: automatically cuts ignition if signal is lost for >10 seconds.
+ * * HARDWARE: 
+ * - ESP32 Development Board
+ * - Relay Module connected to GPIO 27 (Active-LOW)
+ */
+
+#include <WiFi.h>
+#include <esp_now.h>
+
+// --- USER CONFIGURATION ---
+// Replace these with your actual network credentials if using WiFi sync
+const char* ssid = "YOUR_WIFI_SSID";     
+const char* pass = "YOUR_WIFI_PASSWORD"; 
+
+// --- HARDWARE PIN DEFINITIONS ---
+#define RELAY_PIN 27   // Relay connected to GPIO 27 (Active-LOW)
+
+// --- DATA STRUCTURE (Must match Helmet Transmitter) ---
+typedef struct struct_message {
+    uint8_t cmd;    // 0x01 = ON (Helmet Worn), 0x00 = OFF
+    uint32_t seq;   // Packet sequence number for debugging
+} struct_message;
+
+struct_message incomingPacket;
+
+// --- TIMING & STATE ---
+const unsigned long HEARTBEAT_TIMEOUT = 10000; // 10 seconds watchdog timeout
+unsigned long lastRecvTime = 0;
+bool lastRelayState = false; // Tracks state to prevent Serial spam
+
+// --- RELAY CONTROL HELPER ---
+void setMotor(bool on) {
+  // Active-LOW Logic: LOW = ON, HIGH = OFF
+  if (on) {
+    digitalWrite(RELAY_PIN, LOW); 
+    if (!lastRelayState) {
+       Serial.println("\n>>> MOTOR COMMAND: START (Ignition ON) <<<");
+       lastRelayState = true;
+    }
+  } else {
+    digitalWrite(RELAY_PIN, HIGH);
+    if (lastRelayState) {
+       Serial.println("\n>>> MOTOR COMMAND: STOP (Ignition OFF) <<<");
+       lastRelayState = false;
+    }
+  }
+}
+
+// --- ESP-NOW CALLBACK FUNCTION ---
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  // 1. Validate Data Size
+  if (len != sizeof(incomingPacket)) {
+    Serial.print("Warning: Received invalid packet size: ");
+    Serial.println(len);
+    return;
+  }
+
+  // 2. Copy Data to Struct
+  memcpy(&incomingPacket, incomingData, sizeof(incomingPacket));
+
+  // 3. Print Debug Info
+  Serial.printf("RX from %02X:%02X:%02X:%02X:%02X:%02X | Seq: %d | Cmd: %d\n", 
+                info->src_addr[0], info->src_addr[1], info->src_addr[2], 
+                info->src_addr[3], info->src_addr[4], info->src_addr[5],
+                incomingPacket.seq, incomingPacket.cmd);
+
+  // 4. Execute Command & Reset Watchdog
+  lastRecvTime = millis(); 
+  
+  if (incomingPacket.cmd == 0x01) {
+    setMotor(true);
+  } else {
+    setMotor(false);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Init Relay
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH); // Ensure OFF at startup (Active-LOW)
+  lastRelayState = false;
+
+  // --- WIFI SETUP (Required for ESP-NOW Channel Sync) ---
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+  Serial.print("Base Connecting to WiFi (Syncing Channel)");
+  
+  // Note: Depending on use case, you might want a timeout here so it doesn't hang forever
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+  }
+  Serial.print("\nConnected! WiFi Channel: ");
+  Serial.println(WiFi.channel());
+
+  // --- ESP-NOW INIT ---
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    // If ESP-NOW fails, we loop forever to indicate critical failure
+    while (true) delay(1000);
+  }
+
+  // Register Callback
+  esp_now_register_recv_cb(onDataRecv);
+  
+  Serial.println("\n--- BASE STATION READY ---");
+  Serial.print("Device MAC Address: "); Serial.println(WiFi.macAddress());
+  Serial.println("Waiting for Helmet Signal...");
+}
+
+void loop() {
+  // --- SAFETY WATCHDOG ---
+  // If no packet received for HEARTBEAT_TIMEOUT, cut the engine.
+  if (millis() - lastRecvTime > HEARTBEAT_TIMEOUT) {
+    if (lastRelayState == true) { // Only trigger if motor was ON
+       Serial.println("\n!!! SAFETY STOP: Signal Lost > 10s !!!");
+       setMotor(false);
+    }
+  }
+  delay(100);
+}
